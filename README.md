@@ -59,6 +59,8 @@ Your questions and relevant database excerpts are sent to OpenAI, sometimes befo
 
 You can use and adapt this software's code as a starting point for your own breeding-data chat assistant. A new database connection needs appropriate access permission and compatibility checks, and the resulting answers should be checked against known records before use.
 
+This software is available under the [MIT License](LICENSE). Database data and third-party libraries retain their own terms.
+
 ## Citing this project
 
 If you use this software, its code or its outputs in research, **please cite this repository**. Include the version or commit you used so that others can identify the same software.
