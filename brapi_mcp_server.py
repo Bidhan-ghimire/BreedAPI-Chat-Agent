@@ -1,40 +1,14 @@
-"""
-brapi_mcp_server.py — twelve read-only BrAPI tools, callable two ways:
+"""Typed BrAPI tool implementations used by the shared breeding MCP service.
 
-  DIRECT  : dispatch(ctx, "get_study", {"study_db_id": "S1"})   (plain Python, same process)
-  MCP     : python -m brapi_mcp_server --offline --fixture synthetic   (stdio server, child process)
-
-Both routes use ONE registry (TOOLS): the same argument models make the JSON
-schemas the client sees and validate the arguments that arrive. There is no
-second schema definition to drift out of sync.
-
-Rules the tools follow:
-* Every tool returns the ToolResult contract: ok + data, or ok=False + a coded error.
-* Tool arguments can never carry approval, change the server address or name an
-  endpoint. Unknown fields are rejected (extra="forbid").
-* Large tables never travel inside a tool message. get_observations,
-  get_observation_units and export_metadata save a managed artifact and return
-  its handle, a small preview and the true row count.
-* Completeness is always stated; an incomplete collection is never presented as
-  the whole thing.
-* In normal server mode nothing is printed to stdout — stdout is the protocol
-  channel. Diagnostics go to stderr.
-* `--selftest --offline` exercises all twelve tools on the SYNTHETIC fixtures
-  and prints twelve labelled checks without starting MCP.
-
-Everyday example: a library front desk with twelve request forms. Each form has
-fixed boxes (the schema); the clerk (dispatch) fills your request from the same
-form whether you hand it over in person (direct) or send it by mail (MCP).
+Every request passes through BrapiClient and its approval checks. Tables are
+registered as managed artifacts with provenance and completeness. This module
+supplies schemas and dispatch; breeding_mcp_server owns the hosted MCP service.
 """
 from __future__ import annotations
 
-import argparse
-import asyncio
 import dataclasses
 import json
-import logging
 import re
-import sys
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -58,16 +32,12 @@ from contracts import (
     ToolResult,
     dump_json,
 )
-from explore_cassavabase import SYNTHETIC_BASE, seed_synthetic
 
 __all__ = [
-    "SERVER_NAME", "ToolContext", "ToolSpec", "TOOLS", "TOOL_NAMES", "build_context", "dispatch",
-    "tool_schemas", "build_server", "serve_stdio", "run_selftest", "main",
+    "ToolContext", "ToolSpec", "TOOLS", "TOOL_NAMES", "build_context", "dispatch",
+    "tool_schemas",
 ]
 
-SERVER_NAME = "cassava"
-SERVER_VERSION = "0.2"
-log = logging.getLogger("brapi_mcp_server")
 
 
 # --------------------------------------------------------------------------
@@ -89,29 +59,20 @@ class ToolContext:
 def build_context(
     *,
     offline: bool = True,
-    fixture: str | None = None,
     cache_dir: Path | None = None,
     out_dir: Path | None = None,
     run_id: str | None = None,
     approval: FetchApproval | None = None,
     settings: Settings | None = None,
 ) -> ToolContext:
-    """Wire client + registry. fixture='synthetic' uses the invented server and seeds its cache."""
+    """Wire the approved client and managed registry; offline mode never fetches."""
     run_id = run_id or f"mcp_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}_{uuid.uuid4().hex[:6]}"
-    if fixture is not None:
-        if fixture != "synthetic":
-            raise ValueError(f"unknown fixture set {fixture!r}; only 'synthetic' exists")
-        cache_dir = Path(cache_dir) if cache_dir else PART2_DIR / "cache" / "synthetic"
-        settings = Settings(base_url=SYNTHETIC_BASE, mode="offline", cache_dir=cache_dir)
-        cache = CacheStore(cache_dir)
-        seed_synthetic(cache, SYNTHETIC_BASE)      # includes the GET /studies/S1 reply (synthetic_study_S1.json)
-    else:
-        settings = settings or load_settings()
-        if offline and settings.mode != "offline":
-            settings = dataclasses.replace(settings, mode="offline")
-        cache_dir = Path(cache_dir) if cache_dir else settings.cache_dir
-        settings = dataclasses.replace(settings, cache_dir=cache_dir)
-        cache = CacheStore(cache_dir)
+    settings = settings or load_settings()
+    if offline and settings.mode != "offline":
+        settings = dataclasses.replace(settings, mode="offline")
+    cache_dir = Path(cache_dir) if cache_dir else settings.cache_dir
+    settings = dataclasses.replace(settings, cache_dir=cache_dir)
+    cache = CacheStore(cache_dir)
     client = BrapiClient(settings, cache=cache, run_id=run_id)
     registry = ArtifactRegistry(Path(out_dir) if out_dir else PART2_DIR / "out", run_id, base_url=settings.base_url)
     return ToolContext(client=client, registry=registry, approval=approval)
@@ -663,113 +624,3 @@ def dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any] | None) -> T
         return spec.fn(ctx, args)
     except Exception as exc:  # noqa: BLE001 - every failure becomes a coded ToolResult, never a traceback to the caller
         return ToolResult(ok=False, error=_map_exception(exc))
-
-
-# --------------------------------------------------------------------------
-# MCP stdio server (protocol on stdout only)
-# --------------------------------------------------------------------------
-
-def build_server(ctx: ToolContext):
-    """A low-level MCP Server whose tool list and dispatch both come from TOOLS."""
-    import anyio
-    from mcp import types
-    from mcp.server.lowlevel import Server
-
-    server = Server(SERVER_NAME, version=SERVER_VERSION,
-                    instructions="Read-only BrAPI tools. Large tables come back as artifact handles, never inline. "
-                                 "Completeness is always stated; do not treat incomplete collections as whole.")
-
-    @server.list_tools()
-    async def _list_tools() -> list[types.Tool]:
-        return [types.Tool(name=s["name"], description=s["description"], inputSchema=s["inputSchema"]) for s in tool_schemas()]
-
-    @server.call_tool()
-    async def _call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
-        result = await anyio.to_thread.run_sync(dispatch, ctx, name, arguments or {})
-        payload = json.loads(dump_json(result))
-        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(payload))],
-                                    structuredContent=payload, isError=not result.ok)
-
-    return server
-
-
-async def serve_stdio(ctx: ToolContext) -> None:
-    from mcp.server.stdio import stdio_server
-
-    server = build_server(ctx)
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
-
-
-# --------------------------------------------------------------------------
-# Self-test: all twelve tools on the synthetic fixture, no MCP
-# --------------------------------------------------------------------------
-
-def run_selftest(ctx: ToolContext, log_fn: Callable[[str], None] = print) -> int:
-    """Call every tool through dispatch and print twelve labelled checks. Returns 0 when all pass."""
-    run_id = ctx.client.run_id
-    checks: list[tuple[str, dict[str, Any], Callable[[ToolResult], bool], str]] = [
-        ("server_info", {}, lambda r: r.ok and r.data["server_name"] == "SYNTHETIC fixture server", "synthetic server identified"),
-        ("search_studies", {"name_contains": "s1"}, lambda r: r.ok and r.data["total_matches"] == 1 and r.data["candidates"][0]["studyDbId"] == "S1", "1 candidate S1, complete"),
-        ("study_types", {}, lambda r: r.ok and r.data["counts"] == {"Synthetic Yield Trial": 1}, "type counts from a complete collection"),
-        ("get_study", {"study_db_id": "S1"}, lambda r: r.ok and r.data["study"]["studyDbId"] == "S1" and r.data["provenance"]["request_id"], "one study with provenance"),
-        ("list_variables", {"name_contains": "fresh"}, lambda r: r.ok and r.data["total_matches"] == 1 and r.data["variables"][0]["units"] == "t/ha", "V1 fresh root yield, t/ha"),
-        ("get_observations", {"study_db_id": "S1", "variable_db_id": "V1"}, lambda r: r.ok and r.data["row_count"] == 6 and r.complete and r.data["displayed_rows"] == 5 and r.artifact_ids, "6 rows saved as an artifact, 5 previewed, complete"),
-        ("list_locations", {}, lambda r: r.ok and r.data["total_matches"] == 1 and r.complete, "1 location candidate, complete"),
-        ("list_programs", {}, lambda r: r.ok and r.data["returned"] == 1 and r.complete, "1 program, complete"),
-        ("list_seasons", {}, lambda r: r.ok and r.data["returned"] == 1 and r.complete, "1 season, complete"),
-        ("request_log", {"run_id": run_id}, lambda r: r.ok and r.data["count"] >= 9 and all(rec["origin"] == "cache" for rec in r.data["records"]), "request evidence, all from cache"),
-        ("get_observation_units", {"study_db_id": "S1"}, lambda r: r.ok and r.data["row_count"] == 6 and r.data["levels"] == {"plot": 6}, "6 plots, level=plot"),
-        ("export_metadata", {"entity": "variables"}, lambda r: r.ok and r.data["row_count"] == 2 and r.complete, "complete variables export as an artifact"),
-    ]
-    failures = 0
-    for index, (name, args, check, detail) in enumerate(checks, start=1):
-        result = dispatch(ctx, name, args)
-        try:
-            passed = bool(check(result))
-        except Exception:  # noqa: BLE001 - a malformed result is a failed check, not a crash
-            passed = False
-        failures += 0 if passed else 1
-        note = detail if passed else (f"{result.error.code}: {result.error.message}" if result.error else "unexpected data")
-        log_fn(f"[{'PASS' if passed else 'FAIL'}] {index:>2}/12 {name:<22} {note}")
-    log_fn(f"{'ALL 12 CHECKS PASSED' if failures == 0 else f'{failures} CHECK(S) FAILED'}  run_id={run_id}  live_requests="
-           f"{sum(1 for r in ctx.client.provenance() if r.origin == 'live')}")
-    return 0 if failures == 0 else 1
-
-
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
-
-def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="python -m brapi_mcp_server", description=__doc__.split("\n\n")[0])
-    p.add_argument("--offline", action="store_true", help="offline mode (the only mode this server runs in this version)")
-    p.add_argument("--fixture", default=None, help="'synthetic' uses the invented server and seeds its cache")
-    p.add_argument("--cache-dir", default=None)
-    p.add_argument("--out-dir", default=None)
-    p.add_argument("--run-id", default=None)
-    p.add_argument("--selftest", action="store_true", help="run all twelve tools and exit; does not start MCP")
-    return p
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    logging.basicConfig(stream=sys.stderr, level=logging.WARNING)   # diagnostics never go to stdout
-    try:
-        ctx = build_context(offline=True, fixture=args.fixture, cache_dir=Path(args.cache_dir) if args.cache_dir else None,
-                            out_dir=Path(args.out_dir) if args.out_dir else None, run_id=args.run_id)
-    except (ValueError, BrapiClientError, ArtifactError) as exc:
-        print(f"FAILED to build context: {exc}", file=sys.stderr)
-        return 2
-    if args.selftest:
-        return run_selftest(ctx)
-    if ctx.client.settings.mode != "offline":  # pragma: no cover - build_context forces offline
-        print("refusing to serve: this version serves offline only", file=sys.stderr)
-        return 2
-    print(f"{SERVER_NAME} MCP server: offline, base={ctx.client.settings.base_url}, run_id={ctx.client.run_id}", file=sys.stderr)
-    asyncio.run(serve_stdio(ctx))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

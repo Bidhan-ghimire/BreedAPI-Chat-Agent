@@ -1,73 +1,25 @@
-"""
-run.py — the controller: one command runs the whole decision flow as a STATE MACHINE that ordinary
-Python controls. A model is never trusted to remember to ask permission; the code asks.
+"""Controller for the hosted, agent-led breeding assistant.
 
-States, in order (each one is a method on Controller and is recorded in the state trace):
-  config -> plan -> clarify -> metadata -> resolve -> approve -> retrieve -> analyze -> render -> accept -> record
-
-Rules the code enforces:
-* --offline is the default: no live BrAPI request can be made, even on a cache miss.
-* --live (added 2026-09-29) reads the real server named in .env (BRAPI_BASE_URL). It is refused unless BRAPI_MODE=live
-  was set on purpose, ACCESS_NOTES.md records a review date, direct or local memory MCP is used (stdio remains offline)
-  and --auto is NOT used (a human types approve at the screen). The study and variable catalogs must already be cached
-  complete (step 1 of python -m eval.prepare_snapshot --live asks before fetching them); a missing catalog stops the run
-  before any model call. Only after the typed approve does any request leave this computer, and only for the approved
-  studies and variables, within the attempt ceiling: the client checks the approval before every attempt. Replies
-  already in the cache are reused, not fetched again.
-* A plan that is not ready asks the person what the planner needs (never under --auto). The answer is ADDED to the
-  question, never put in its place (2026-09-29: a restated question used to replace the first one, so an answer such as
-  "4501" reached the planner alone). At most max_clarification_rounds rounds: 1 on the command line, 3 in the chat.
-  The Analyst may ask too; the answer goes back to it with the data already fetched (nothing is fetched again). While a
-  person reads and types, the run's time budget is paused, like a chess clock.
-* With a person at the approval screen, the planner may judge that a question is about several studies even without the
-  word "studies" ("study", "stdy"); the screen then shows that scope and asks the person to check it. --auto keeps the
-  strict wording rule, because nobody checks the scope there.
-* --mock-model uses scripted replies; without it the model configured in .env is used (a real-model run is approved
-  separately by Bidhan; a remote endpoint needs LLM_ALLOW_REMOTE=true set for that command).
-* --direct changes the tool transport only (in-process instead of an MCP child); results are the same.
-* app_mcp selects real MCP over SDK memory streams: initialization, discovery and tool calls go through ClientSession
-  and the existing MCP server. The server shares the controller-owned approved context; tool arguments cannot supply it.
-* --auto NEVER calls input(), never grants live permission and never records human acceptance. It may run
-  a prepared offline snapshot within its limits, using an explicit code-issued approval that names only that
-  snapshot's server while every client stays offline (no connection to any BrAPI server is opened), so it
-  is no back door to live data.
-* --snapshot ID reads ONLY the verified snapshot: every fingerprint in snapshots/<ID> is re-checked first,
-  the cache copy inside the snapshot is the sole data source, and the server address comes from the
-  snapshot manifest. A tampered or unprepared snapshot blocks the run before any work.
-* The approval screen shows interpretation, variables and units, source server, study IDs, exclusions,
-  expected calls and hard limits; the human types approve / edit / cancel. An edit changes the manifest and
-  therefore throws away the earlier approval; a denial or a cancel ends the run with NO retrieval, and the
-  saved request log proves it. --max-fetches is a ceiling on fetch tool calls, never a permission.
-* The FetchApproval goes to every dispatch path: the ApprovedTools gate in front of the Retriever, and
-  the in-process ToolContext when direct or memory MCP is used (the stdio child receives no approval in this version and
-  therefore refuses any live attempt).
-* Counts are real: attempts and distinct studies come from the request log and the ledger, never from a
-  model's estimate. Every run — success, failure, block, cancel — writes out/<run_id>/answer.md,
-  answer.json and manifest.json and prints the exact paths. All evidence is kept, not the last 30 lines.
-* Ctrl+C: the MCP child is closed and the run is saved with execution_status "canceled".
-
-Everyday example: a bank teller's checklist. The customer (question) is served step by step; the teller
-never skips the signature (approval) because a colleague (model) says it is fine; a stamped form
-(answer.json) records what was done — including "cancelled at the window".
+The Coordinator proposes actions; Python enforces their order, budgets, scopes,
+and human review. One shared MCP service supplies BrAPI retrieval and analysis
+tools. Catalog setup, data retrieval, analysis review, and final acceptance keep
+separate recorded decisions. Offline fixture/CLI runners are not part of this
+Hugging Face package; model injection remains available to offline test harnesses.
 """
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import math
-import sys
 import time
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Callable, Literal
 
-from agents.analyst import AnalysisInput, load_analyst_script, registry_prefix, run_analyst
-from agents.analyst import FIXTURE_DIR as ANALYST_FIXTURES
+from agents.analyst import AnalysisInput, registry_prefix, run_analyst
 from agents.coordinator import (
     WHOLE_SET_WORDS,
     CoordinatorResult,
@@ -79,9 +31,9 @@ from agents.coordinator import (
     render_numeric_table,
     sanitize_prose,
 )
-from agents.retriever import RETRIEVER_SYSTEM_PROMPT, RETRIEVER_TOOLS, ApprovedTools, build_report, catalog_export_records, load_model_script
+from agents.retriever import RETRIEVER_SYSTEM_PROMPT, RETRIEVER_TOOLS, ApprovedTools, build_report, catalog_export_records
 from brapi_client import PART2_DIR, Settings, load_settings
-from brapi_mcp_server import ToolContext, build_context, dispatch
+from brapi_mcp_server import ToolContext, build_context
 from contracts import (
     AnalysisReport,
     Claim,
@@ -96,27 +48,24 @@ from contracts import (
     approval_mismatches,
     dump_json,
 )
-from eval.prepare_snapshot import verify_snapshot
-from explore_cassavabase import ACCESS_NOTES_PATH, SYNTHETIC_BASE, access_notes_review_date
-from llm import Budget, FakeModelClient, ModelClient, compact_tool_result, reply_text, run_agent_loop
+from access_policy import ACCESS_NOTES_PATH, access_notes_review_date
+from llm import Budget, ModelClient, compact_tool_result, run_agent_loop
 from mcp_bridge import BridgeError, McpTools
 from artifacts import ArtifactError
 from plan_permissions import endpoint_families_for_plan
 from retrieval_review import review_snapshot, verify_reviewed_tables
 from metadata_answers import metadata_only_plan, materialize_metadata, analyze_metadata, render_metadata_facts
-from catalog_answers import catalog_count_plan, capture_catalog_sources, run_catalog_plan, run_catalog_plan_async
-from analyst_mcp_server import build_analyst_server
+from catalog_answers import catalog_count_plan, capture_catalog_sources, run_catalog_plan_async
 from breeding_mcp_server import BreedingMcpService
 from coordination_runtime import run_agent_led, SUPERVISOR_PROMPT
 
 __all__ = [
-    "RunConfig", "Models", "Controller", "EXIT_CODES", "mock_coordinator_model", "synthetic_plan_draft", "build_approval",
-    "scope_mismatches", "snapshot_source", "parse_args", "main", "CLARIFY_PROMPT", "ANALYST_PROMPT", "analyst_questions",
+    "RunConfig", "Models", "Controller", "EXIT_CODES", "build_approval",
+    "scope_mismatches", "CLARIFY_PROMPT", "ANALYST_PROMPT", "analyst_questions",
     "RETRIEVER_PROMPT", "DATA_REVIEW_PROMPT", "scope_needs_a_check", "readable_answer", "required_fetches", "plan_too_wide", "CATALOG_PROMPT",
 ]
 
 EXIT_CODES = {"completed": 0, "incomplete": 1, "failed": 1, "limit_reached": 1, "blocked": 3, "needs_clarification": 3, "canceled": 130}
-CONFIG_ERROR_EXIT = 2
 CLARIFY_PROMPT = "Answer the question above; your answer is added to your question (empty = cancel): "
 CATALOG_PROMPT = "approve catalog / cancel: "
 CATALOG_MAX_HTTP_ATTEMPTS = 20  # separate metadata-only budget, never observation permission
@@ -138,28 +87,23 @@ AnswerFn = Callable[[str], str]
 @dataclass(frozen=True)
 class RunConfig:
     question: str
-    offline: bool = True
-    mock_model: bool = True
+    offline: bool = True  # fail closed until the hosted entrypoint selects live mode
+    mock_model: bool = False
     direct: bool = False
     auto: bool = False
     max_fetches: int = 5
     max_http_attempts: int = 20
-    snapshot: str | None = None
-    fixture: str | None = "synthetic"
     out_dir: Path = PART2_DIR / "out"
     cache_dir: Path | None = None
-    snapshots_dir: Path = PART2_DIR / "snapshots"
-    access_notes: Path = ACCESS_NOTES_PATH                  # harness only: the review line a live run requires
+    access_notes: Path = ACCESS_NOTES_PATH
     read_timeout: float | None = None
     max_elapsed_seconds: float = 300.0
     bootstrap_catalogs: bool = False
-    max_clarification_rounds: int = 1                       # how many times the person may answer the planner (the chat uses 3)
-
-    mcp_transport: Literal["stdio", "memory"] = "stdio"
-    review_retrieved_data: bool = False       # local MCP chat opts in; legacy/offline callers retain their workflow
-
-    agent_led: bool = False
-    unified_mcp: bool = False
+    max_clarification_rounds: int = 1
+    mcp_transport: Literal["memory"] = "memory"
+    review_retrieved_data: bool = True
+    agent_led: bool = True
+    unified_mcp: bool = True
     max_supervisor_turns: int = 8
 
     @property
@@ -168,18 +112,18 @@ class RunConfig:
 
     def validate(self) -> list[str]:
         problems: list[str] = []
-        if self.unified_mcp and (not self.uses_memory_mcp or not self.review_retrieved_data):
-            problems.append("shared MCP requires memory transport and human data review")
-        if self.agent_led and not self.unified_mcp:
-            problems.append("agent-led coordination requires the shared local MCP service")
+        if self.offline:
+            problems.append("the hosted app requires live configuration; offline fixture runs are not included")
+        if self.mock_model:
+            problems.append("scripted fixture models are not included in the hosted app")
+        if not self.uses_memory_mcp or not self.unified_mcp:
+            problems.append("the hosted app requires the shared MCP service over memory transport")
+        if not self.review_retrieved_data or self.auto:
+            problems.append("the hosted app requires human approval and retrieved-data review")
+        if not self.agent_led:
+            problems.append("the hosted app requires agent-led coordination")
         if type(self.max_supervisor_turns) is not int or not 3 <= self.max_supervisor_turns <= 16:
             problems.append("max_supervisor_turns must be an integer between 3 and 16")
-        if self.review_retrieved_data and self.auto:
-            problems.append("retrieved-data review requires a person; --auto cannot approve analysis")
-        if self.mcp_transport not in ("stdio", "memory"):
-            problems.append("mcp_transport must be stdio or memory")
-        if self.direct and self.mcp_transport == "memory":
-            problems.append("memory MCP requires direct=False")
         if self.read_timeout is not None and (not math.isfinite(self.read_timeout) or not 1 <= self.read_timeout <= 600):
             problems.append("read_timeout must be finite and between 1 and 600 seconds")
         if not math.isfinite(self.max_elapsed_seconds) or not 60 <= self.max_elapsed_seconds <= 3600:
@@ -191,121 +135,35 @@ class RunConfig:
         if not self.offline:
             problems.extend(self._live_problems())
         if self.max_fetches < 1:
-            problems.append("--max-fetches must be at least 1")
+            problems.append("max_fetches must be at least 1")
         if self.max_http_attempts < 1:
-            problems.append("--max-http-attempts must be at least 1")
-        if self.fixture not in (None, "synthetic"):
-            problems.append(f"unknown fixture {self.fixture!r}; only 'synthetic' exists")
-        if self.offline and self.fixture is None and self.snapshot is None:
-            problems.append("choose --fixture synthetic or --snapshot ID; a run needs a prepared offline source")
-        if self.snapshot is not None and self.fixture is not None:
-            problems.append("--snapshot and --fixture exclude each other")
-        if self.snapshot is not None and self.cache_dir is not None:
-            problems.append("--cache-dir cannot be combined with --snapshot; the snapshot's own cache copy is the only data source")
-        if self.snapshot is not None:
-            problems.extend(snapshot_source(Path(self.snapshots_dir) / self.snapshot)[2])
+            problems.append("max_http_attempts must be at least 1")
         return problems
 
     def _live_problems(self) -> list[str]:
-        """Every precondition of a live run, checked before anything else happens (no model call, no request)."""
+        """Check deployment access before any model call or database request."""
         problems: list[str] = []
-        if self.snapshot is not None or self.fixture is not None:
-            problems.append("--live reads the real server named in .env; it cannot be combined with --snapshot or --fixture")
-        if not self.direct and self.mcp_transport != "memory":
-            problems.append("a live run uses --direct or local memory MCP: the stdio child cannot receive live approval")
-        if self.auto:
-            problems.append("a live run needs a human at the approval screen; --auto never grants live access")
         if load_settings().mode != "live":
-            problems.append("BRAPI_MODE is not 'live'; set it for this one command, on purpose (the client stays offline otherwise)")
+            problems.append("BRAPI_MODE is not 'live'; enable it in the Space settings (the client stays offline otherwise)")
         if access_notes_review_date(self.access_notes) is None:
             problems.append(f"{Path(self.access_notes).name} has no 'Reviewed by Bidhan on: YYYY-MM-DD' line; read it and record your review first")
         return problems
 
-    @property
-    def snapshot_id(self) -> str:
-        return self.snapshot or f"fixture_{self.fixture}"
-
-
-def snapshot_source(snapshot_dir: Path) -> tuple[Path, str | None, list[str]]:
-    """Where a prepared snapshot keeps its data and which server it came from, after re-checking every fingerprint.
-
-    Returns (cache_dir, base_url, problems). problems is empty only for a verified snapshot; a missing manifest,
-    a changed byte or a missing cache copy is reported, and the caller must not run against it.
-    """
-    snapshot_dir = Path(snapshot_dir)
-    cache_dir = snapshot_dir / "cache"
-    if not (snapshot_dir / "manifest.json").is_file():
-        return cache_dir, None, [f"snapshot {snapshot_dir.name!r} is not prepared under {snapshot_dir.parent} (no manifest.json)"]
-    try:
-        check = verify_snapshot(snapshot_dir)
-    except Exception as exc:  # noqa: BLE001 - a snapshot that cannot even be read is unverified; the reason is kept, the run is refused
-        return cache_dir, None, [f"snapshot {snapshot_dir.name!r} failed verification: it could not be read ({type(exc).__name__}: {str(exc)[:120]})"]
-    if not check.ok:
-        shown = [f"snapshot {snapshot_dir.name!r} failed verification: {p}" for p in check.problems[:3]]
-        if len(check.problems) > 3:                                    # never silently: say how many problems are not listed
-            shown.append(f"snapshot {snapshot_dir.name!r} failed verification: and {len(check.problems) - 3} more problem(s) not listed here")
-        return cache_dir, None, shown
-    base_url = (check.manifest.get("source") or {}).get("base_url") or None
-    problems: list[str] = []
-    if base_url is None:
-        problems.append(f"snapshot {snapshot_dir.name!r} names no source server")
-    if not cache_dir.is_dir():
-        problems.append(f"snapshot {snapshot_dir.name!r} has no cache copy; prepare it again")
-    return cache_dir, base_url, problems
-
 
 @dataclass
 class Models:
-    """Which model answers for which agent. Tests inject fakes; --mock-model builds scripted ones."""
+    """Which model answers for each agent. Offline tests can inject explicit fakes."""
 
     coordinator: ModelClient | None = None
     retriever: ModelClient | None = None
     analyst_factory: Callable[[str], ModelClient] | None = None     # prefix -> model (handles are known only at run time)
-    requested: str = "mock-model"
+    requested: str = "configured model"
     supervisor: ModelClient | None = None
 
 
 # --------------------------------------------------------------------------
-# Mock models for the synthetic harness (scripted, question-aware, no real model)
+# Approval reply classification
 # --------------------------------------------------------------------------
-
-def synthetic_plan_draft(study_id: str, variable_id: str) -> dict[str, Any]:
-    """The A/B plan for the teaching fixture, as a Coordinator draft (no counts, no budgets, no approvals)."""
-    return {
-        "interpretation": f"pooled and per-clone descriptive means of variable {variable_id} in study {study_id}, with named n",
-        "clarifications": [],
-        "scope": {"study_ids": [study_id], "variable_ids": [variable_id]},
-        "statistic": {"kind": "mean", "denominator": "valid plot-level values", "grouping": ["germplasmDbId"]},
-        "steps": [
-            {"step_id": "step_1", "agent": "retriever", "action": "get_observations", "inputs": {"study_db_id": study_id, "variable_db_id": variable_id}},
-            {"step_id": "step_2", "agent": "retriever", "action": "get_observation_units", "inputs": {"study_db_id": study_id}},
-            {"step_id": "step_3", "agent": "analyst", "action": "numeric_summary", "depends_on": ["step_1", "step_2"]},
-            {"step_id": "step_4", "agent": "analyst", "action": "group_stats", "inputs": {"by": "germplasmDbId"}, "depends_on": ["step_1", "step_2"]},
-        ],
-    }
-
-
-def mock_coordinator_model(question: str, metadata: KnownMetadata | None) -> FakeModelClient:
-    """A scripted Coordinator that models ambiguity: a valid plan ONLY for a question naming one study and one trait."""
-    cands = find_candidates(question, metadata)
-    if metadata is not None and len(cands.studies) == 1 and len(cands.variables) == 1 and not cands.decision_words:
-        payload = synthetic_plan_draft(cands.studies[0].study_id, cands.variables[0].variable_id)
-        return FakeModelClient([reply_text(json.dumps({"status": "completed", "payload": payload}), model="mock-model")], reported_model="mock-model")
-    if cands.decision_words:
-        question_text = (f"The question asks for {', '.join(cands.decision_words)}, a breeding judgement this assistant does not make. "
-                         "Which study and which trait should be described with plain means and named n?")
-    elif metadata is None:
-        question_text = "No validated metadata is available offline; which study and trait should be discovered?"
-    elif not cands.studies:
-        question_text = f"Which study is meant? Known studies: {', '.join(s.study_id + ' ' + repr(s.name) for s in metadata.studies)}."
-    else:
-        question_text = f"Which trait is meant? Known variables: {', '.join(v.variable_id + ' ' + repr(v.name) for v in metadata.variables)}."
-    return FakeModelClient([reply_text(json.dumps({"status": "needs_clarification", "question": question_text}), model="mock-model")], reported_model="mock-model")
-
-
-def synthetic_models() -> Models:
-    return Models(coordinator=None, retriever=load_model_script("valid_request.json"),
-                  analyst_factory=lambda prefix: load_analyst_script("valid_ab.json", ANALYST_FIXTURES, prefix=prefix), requested="mock-model")
 
 
 # Only a literal "approve" authorizes work. Other control words retain their denial behavior.
@@ -533,18 +391,8 @@ def build_approval(manifest: FetchManifest, *, issued_by_human: bool, now: datet
 
 
 def scope_mismatches(manifest: FetchManifest, approval: FetchApproval) -> list[str]:
-    """approval_mismatches without the origin line: a snapshot manifest still needs its scope gate to match."""
+    """Check that the approval still names the exact requested scope."""
     return [p for p in approval_mismatches(manifest, approval) if not p.startswith("manifest origin is")]
-
-
-class _LedgerStub:
-    """Collects blocked-study entries while the MCP child owns the registry; applied after the child exits."""
-
-    def __init__(self) -> None:
-        self.entries: list[tuple[str, str, str | None]] = []
-
-    def record_study(self, study_id: str, status: str, *, reason: str | None = None, **_: Any) -> None:
-        self.entries.append((study_id, status, reason))
 
 
 # --------------------------------------------------------------------------
@@ -613,17 +461,10 @@ class Controller:
         self._real_client: ModelClient | None = None
         self.answers_simulated = self.answer_fn is not None and not self.answers_from_human
         self.run_dir = Path(self.config.out_dir) / self.run_id
-        self.snapshot_problems: list[str] = []                        # what the last check found; _server() checks again before every use
         self.catalog_fetched_at: str | None = None                      # when the cached catalogs were fetched (shown on the screen)
-        if self.config.snapshot:                                       # the verified snapshot is the only data source
-            self.cache_dir, self.base_url, self.snapshot_problems = snapshot_source(Path(self.config.snapshots_dir) / self.config.snapshot)
-        elif not self.config.offline:                                  # live: the server from .env and its own cache folder (cache/live)
-            settings = load_settings()
-            self.cache_dir = Path(self.config.cache_dir) if self.config.cache_dir else settings.cache_dir / "live"
-            self.base_url = settings.base_url
-        else:
-            self.cache_dir = Path(self.config.cache_dir) if self.config.cache_dir else PART2_DIR / "cache" / "synthetic"
-            self.base_url = SYNTHETIC_BASE if self.config.fixture == "synthetic" else None
+        settings = load_settings()
+        self.cache_dir = Path(self.config.cache_dir) if self.config.cache_dir else settings.cache_dir / "live"
+        self.base_url = settings.base_url
 
     # -- small helpers ---------------------------------------------------------------
 
@@ -650,12 +491,10 @@ class Controller:
     async def _model_for_coordinator(self) -> ModelClient:
         if self.models.coordinator is not None:
             return self.models.coordinator
-        if self.config.mock_model:
-            return mock_coordinator_model(self.config.question, self.metadata)
         return await self._real_model()
 
     async def _real_model(self) -> ModelClient:
-        """The local model from .env, opened once per run and closed with the run (never a remote endpoint)."""
+        """The configured model, opened once per run and closed with the run."""
         if self._real_client is None:
             from llm import OpenAICompatibleClient, load_llm_settings
 
@@ -666,18 +505,10 @@ class Controller:
         return self._real_client
 
     def _server(self) -> str:
-        """The server this run names. For a snapshot that is the verified snapshot's own server and nothing else: the snapshot
-        is checked AGAIN here, at the moment of use, and an unverified one stops the step instead of borrowing the synthetic
-        server's name (fail closed). A check made earlier is not trusted: the files may have changed since. The price is one
-        more pass over the snapshot's fingerprints per call; for a large snapshot that is a cost to weigh, not a reason to skip."""
-        if self.config.snapshot:
-            self.cache_dir, base_url, self.snapshot_problems = snapshot_source(Path(self.config.snapshots_dir) / self.config.snapshot)
-            if self.snapshot_problems or not base_url:
-                raise RuntimeError("the snapshot is not verified, so no step may run against it: "
-                                   + ("; ".join(self.snapshot_problems) or "it names no source server"))
-            self.base_url = base_url
-            return base_url
-        return self.base_url or SYNTHETIC_BASE
+        """The configured source server; never substitute an invented source."""
+        if not self.base_url:
+            raise RuntimeError("the run has no configured source server")
+        return self.base_url
 
     def _live_settings(self) -> Settings:
         settings = replace(load_settings(), cache_dir=self.cache_dir)
@@ -687,23 +518,19 @@ class Controller:
         return settings
 
     def _build_ctx(self, out_dir: Path, *, cache_only: bool = False, run_id: str | None = None) -> ToolContext:
-        if not self.config.offline:                                    # live: the client may go online, but only under an approval
-            settings = self._live_settings()
-            if cache_only:
-                settings = replace(settings, mode="offline")
-            return build_context(fixture=None, cache_dir=self.cache_dir, out_dir=out_dir, run_id=run_id or self.run_id,
-                                 offline=cache_only, settings=settings)
-        if self.config.snapshot:                                       # snapshot: its server address, its cache copy, offline, nothing seeded
-            settings = Settings(base_url=self._server(), mode="offline", cache_dir=self.cache_dir)
-            return build_context(fixture=None, cache_dir=self.cache_dir, out_dir=out_dir, run_id=self.run_id, offline=True, settings=settings)
-        return build_context(fixture=self.config.fixture, cache_dir=self.cache_dir, out_dir=out_dir, run_id=self.run_id, offline=True)
+        settings = self._live_settings()
+        offline = cache_only or self.config.offline
+        if offline:
+            settings = replace(settings, mode="offline")
+        return build_context(cache_dir=self.cache_dir, out_dir=out_dir, run_id=run_id or self.run_id,
+                             offline=offline, settings=settings)
 
     @asynccontextmanager
     async def _memory_tools(self, ctx: ToolContext, phase: str, *, server_factory=None):
         """One real MCP session with controller-owned authority and observable protocol events."""
         self.budget.start(_clock)
         remaining = lambda: max(0.0, self.budget.max_elapsed_seconds - self.budget.elapsed(_clock))
-        if self.config.unified_mcp and server_factory is None:
+        if server_factory is None:
             server_factory = lambda context: BreedingMcpService(context, now_utc=self.now, catalog_only=True).server
         options = {"server_factory": server_factory} if server_factory is not None else {}
         raw = McpTools.memory(ctx, call_timeout=self.config.max_elapsed_seconds, remaining_time=remaining, **options)
@@ -714,9 +541,8 @@ class Controller:
         finally:
             self.mcp_sessions.append({"phase": phase, "protocol": "mcp", "transport": "memory",
                                       "run_id": ctx.client.run_id, "events": list(raw.protocol_events),
-                                      **({"server": "breeding-assistant",
-                                          "phases": list(self._shared_phases) if phase == "workflow" else [phase]}
-                                         if self.config.unified_mcp else {})})
+                                      "server": "breeding-assistant",
+                                      "phases": list(self._shared_phases) if phase == "workflow" else [phase]})
 
     @asynccontextmanager
     async def _shared_retrieval_tools(self):
@@ -740,27 +566,19 @@ class Controller:
 
     @asynccontextmanager
     async def _analysis_tools(self, artifact_ids: list[str]):
-        """Local MCP analysis has its own eight-tool server scoped to these saved tables."""
-        if not self.config.uses_memory_mcp:
-            yield None
-            return
+        """Enable analysis only on the same shared service and human-reviewed tables."""
         assert self.ctx is not None
-        if self.config.unified_mcp:
-            if self._shared_service is None or self._shared_raw is None or self.data_review["status"] != "approved":
-                raise RuntimeError("shared analysis requires completed retrieval and human data review")
-            requested = frozenset(artifact_ids)
-            if self._shared_service.phase == "suspended":
-                await self._shared_service.enable_analysis(list(artifact_ids))
-                self._shared_analysis_ids = requested
-                self._shared_phases.append("analysis")
-            elif self._shared_service.phase != "analysis" or requested != self._shared_analysis_ids:
-                raise RuntimeError("analysis cannot change its reviewed artifact scope")
-            await self._shared_raw.schemas()
-            yield self._shared_raw
-            return
-        factory = lambda ctx: build_analyst_server(ctx.registry, list(artifact_ids))
-        async with self._memory_tools(self.ctx, "analysis", server_factory=factory) as raw:
-            yield raw
+        if self._shared_service is None or self._shared_raw is None or self.data_review["status"] != "approved":
+            raise RuntimeError("shared analysis requires completed retrieval and human data review")
+        requested = frozenset(artifact_ids)
+        if self._shared_service.phase == "suspended":
+            await self._shared_service.enable_analysis(list(artifact_ids))
+            self._shared_analysis_ids = requested
+            self._shared_phases.append("analysis")
+        elif self._shared_service.phase != "analysis" or requested != self._shared_analysis_ids:
+            raise RuntimeError("analysis cannot change its reviewed artifact scope")
+        await self._shared_raw.schemas()
+        yield self._shared_raw
 
     # -- the state machine -----------------------------------------------------------
 
@@ -788,75 +606,19 @@ class Controller:
             self.notes.extend(f"configuration: {p}" for p in problems)
             return False
         self._enter("metadata")
-        self.metadata = await self._load_metadata_mcp() if self.config.uses_memory_mcp else self.load_metadata()
-        if not self.config.offline and self.metadata is None and self.config.bootstrap_catalogs:
-            prepared = await self._bootstrap_metadata_mcp() if self.config.uses_memory_mcp else self.bootstrap_metadata()
-            if not prepared:
+        self.metadata = await self._load_metadata_mcp()
+        if self.metadata is None and self.config.bootstrap_catalogs:
+            if not await self._bootstrap_metadata_mcp():
                 return False
-        if not self.config.offline and self.metadata is None:
+        if self.metadata is None:
             self.execution_status = "blocked"
             self.notes.append(f"live run stopped before any model call: the complete study and variable catalogs of {self.base_url} are not "
-                              "cached; cache them with step 1 of python -m eval.prepare_snapshot --live (it asks before fetching)")
+                              "cached; start a new question and approve the app's catalog setup request")
             return False
-        if self.config.agent_led:
-            return await run_agent_led(self)
-        while True:
-            self._enter("plan")
-            await self.plan_phase()
-            if self.plan is None or self.plan.status != "ready":
-                self._enter("clarify")
-                if not await self.clarify_phase():
-                    return False
-            self._enter("resolve")
-            self.manifest = self.resolve_manifest()
-            self._enter("approve")
-            if self.approve_phase():
-                break
-            if self.pending_approval_revision is None:
-                return False
-            revision = self.pending_approval_revision
-            self.pending_approval_revision = None
-            self.config = replace(self.config, question=add_clarification(self.config.question, revision))
-            # Reuse the metadata and shared budget; the revised manifest needs a fresh literal approve.
-        self._enter("retrieve")
-        await self.retrieve_phase()
-        if self.retrieval is None or self.retrieval.status != "completed":
-            self.execution_status = "canceled" if self.retrieval_canceled else (self.retrieval.status if self.retrieval is not None else "failed")
-            self.notes.append("retrieval did not complete; the Analyst was not run")
-            return False
-        if self.config.review_retrieved_data:
-            self._enter("review_data")
-            if not self.review_data_phase():
-                return False
-        self._enter("analyze")
-        await self.analyze_phase()
-        if self.analysis is None or self.analysis.status != "completed":
-            self.execution_status = "canceled" if self.analysis_canceled else (self.analysis.status if self.analysis is not None else "failed")
-            return False
-        self._enter("render")
-        self.render_phase()
-        self.execution_status = "completed"
-        self._enter("accept")
-        self.accept_phase()
-        return True
+        return await run_agent_led(self)
 
     # -- metadata: approved cached exports, never a silent live discovery -------------------
 
-    def load_metadata(self) -> KnownMetadata | None:
-        """Validated records from the offline cache. A cache miss is reported, not fetched."""
-        meta_ctx = self._build_ctx(self.run_dir / "metadata", cache_only=True)
-        studies = dispatch(meta_ctx, "export_metadata", {"entity": "studies"})
-        variables = dispatch(meta_ctx, "export_metadata", {"entity": "variables"})
-        self.meta_requests = len(meta_ctx.client.provenance())
-        fetched = sorted(r.fetched_at_utc.isoformat() for r in meta_ctx.client.provenance() if r.fetched_at_utc is not None)
-        self.catalog_fetched_at = fetched[0] if fetched else None
-        if not (studies.ok and variables.ok):
-            self.notes.append("metadata is not in the offline cache; live discovery would need a separate bounded approval")
-            return None
-        metadata = KnownMetadata.from_registry(meta_ctx.registry, base_url=meta_ctx.client.settings.base_url,
-                                               studies_artifact=studies.artifact_ids[0], variables_artifact=variables.artifact_ids[0])
-        self.base_url = metadata.base_url
-        return metadata
 
     async def _load_metadata_mcp(self) -> KnownMetadata | None:
         """Validated records from the offline cache. A cache miss is reported, not fetched."""
@@ -886,57 +648,6 @@ class Controller:
                 "This separate catalog budget does not grant approval for the later question. "
                 "Catalog replies are shared in this app's public-data cache.")
 
-    def bootstrap_metadata(self) -> bool:
-        """An opt-in cold-start path. A distinct approval grants metadata families only."""
-        catalog_run_id = self.run_id + "_catalog"
-        manifest = FetchManifest(run_id=catalog_run_id, base_url=self._server(), origin="live",
-                                 endpoint_families=["studies", "observationvariables"],
-                                 max_http_attempts=CATALOG_MAX_HTTP_ATTEMPTS, max_observation_studies=0)
-        self.catalog_setup = {"manifest": manifest.model_dump(mode="json"), "manifest_sha256": manifest.sha256(),
-                              "approval": None, "status": "pending", "requests": []}
-        if self.config.auto or self.config.offline:
-            self.catalog_setup["status"] = "blocked"
-            self.execution_status = "blocked"
-            self.notes.append("catalog setup needs a separate live human approval")
-            return False
-        print(self.catalog_approval_screen())
-        answer = self._ask(CATALOG_PROMPT)
-        if answer is None or answer.lower() != "approve catalog":
-            self.catalog_setup["status"] = "canceled"
-            self.execution_status = "canceled"
-            self.notes.append("catalog setup canceled before any model call or live request")
-            return False
-        approval = build_approval(manifest, issued_by_human=True, now=self.now())
-        self.catalog_setup.update(approval=approval.model_dump(mode="json"), status="fetching")
-        meta_ctx = None
-        try:
-            self.budget.start(_clock)
-            meta_ctx = self._build_ctx(self.run_dir / "metadata", run_id=catalog_run_id)
-            meta_ctx.approval = approval
-            meta_ctx.export_max_pages = CATALOG_MAX_PAGES
-            exports = []
-            for entity in ("studies", "variables"):
-                result = dispatch(meta_ctx, "export_metadata", {"entity": entity})
-                if not result.ok or not result.complete:
-                    self.catalog_setup["status"] = "incomplete"
-                    self.execution_status = "incomplete"
-                    why = result.error.message if result.error is not None else "catalog completeness was not established"
-                    self.notes.append(f"catalog setup stopped at {entity}: {why}; no model was called")
-                    return False
-                exports.append(result.artifact_ids[0])
-            self.metadata = KnownMetadata.from_registry(meta_ctx.registry, base_url=meta_ctx.client.settings.base_url,
-                                                        studies_artifact=exports[0], variables_artifact=exports[1])
-            fetched = sorted(record.fetched_at_utc.isoformat() for record in meta_ctx.client.provenance()
-                             if record.fetched_at_utc is not None)
-            self.catalog_fetched_at = fetched[0] if fetched else None
-            self.catalog_setup["status"] = "completed"
-            self.notes.append("complete study and variable catalogs prepared under a separate metadata-only human approval")
-            return True
-        finally:
-            self.catalog_requests = [record.model_dump(mode="json") for record in meta_ctx.client.provenance()] if meta_ctx is not None else []
-            self.catalog_setup["requests"] = list(self.catalog_requests)
-            if self.catalog_setup["status"] == "fetching":
-                self.catalog_setup["status"] = "interrupted"
 
     async def _bootstrap_metadata_mcp(self) -> bool:
         """An opt-in cold-start path. A distinct approval grants metadata families only."""
@@ -994,7 +705,7 @@ class Controller:
     # -- plan and clarify -----------------------------------------------------------------
 
     async def plan_phase(self) -> None:
-        server = self._server()                                        # first: no model is asked about an unverified snapshot
+        server = self._server()
         self.coordination = await draft_plan(self.config.question, model=await self._model_for_coordinator(), metadata=self.metadata,
                                              base_url=server, budget=self.budget, run_id=self.run_id,
                                              log_dir=self.run_dir.parent, model_requested=self.models.requested, now=self.now(),
@@ -1067,8 +778,8 @@ class Controller:
         variables = list(self.plan.scope.variable_ids)
         families = endpoint_families_for_plan(self.plan)
         pairs, units = required_fetches(self.plan)
-        return FetchManifest(run_id=self.run_id, base_url=self._server(), origin="snapshot" if self.config.offline else "live",
-                             snapshot_id=self.config.snapshot_id if self.config.offline else None, endpoint_families=families,   # type: ignore[arg-type]
+        return FetchManifest(run_id=self.run_id, base_url=self._server(), origin="live",
+                             endpoint_families=families,   # type: ignore[arg-type]
                              observation_study_ids=studies if (pairs or units) else [], observation_variable_ids=variables if pairs else [],
                              max_http_attempts=self.config.max_http_attempts, max_observation_studies=len(studies) if (pairs or units) else 0)
 
@@ -1112,17 +823,12 @@ class Controller:
         return "\n".join(lines)
 
     def approve_phase(self) -> bool:
-        """Literal approve permits work; substantive replies request replanning. --auto stays snapshot-only."""
+        """Literal approve permits work; substantive replies request replanning."""
         assert self.manifest is not None
         if self.config.auto:
-            if self.manifest.origin != "snapshot":
-                self.execution_status = "blocked"
-                self.notes.append("--auto never grants live permission; a live manifest needs a human at the approval screen")
-                return False
-            self.approval = build_approval(self.manifest, issued_by_human=False, now=self.now())
-            self.notes.append(f"approval {self.approval.approval_id}: code-issued for the offline snapshot {self.manifest.snapshot_id!r} under --auto; "
-                              "it names only the snapshot's server and grants no live access")
-            return True
+            self.execution_status = "blocked"
+            self.notes.append("automatic approval is not supported; live requests need a human at the approval screen")
+            return False
         for _edit in range(4):
             print(self.approval_screen())
             answer = self._ask("approve / edit / cancel: ")
@@ -1256,40 +962,24 @@ class Controller:
         return True
 
     async def retrieve_phase(self) -> None:
-        """The approved Retriever using stdio MCP, local memory MCP, or the legacy direct route."""
+        """The approved Retriever uses the shared MCP service."""
         assert self.manifest is not None
-        server = self._server()                                        # first: no model, no context and no child for an unverified snapshot
+        self._server()
         if self.approval is not None:
             problems = scope_mismatches(self.manifest, self.approval)
             if problems:
                 raise RuntimeError("approval does not match the manifest: " + "; ".join(problems))
-        model = self.models.retriever or (load_model_script("valid_request.json") if self.config.mock_model else await self._real_model())
-        stub = _LedgerStub()
-        if self.config.direct or self.config.uses_memory_mcp:
-            self.ctx = self._build_ctx(self.run_dir.parent)
-            if not self.config.offline:
-                self.ctx.variable_measurements = {v.variable_id: MeasurementMeta(trait=v.trait or v.name or None, unit=v.unit)
-                                                  for v in (self.metadata.variables if self.metadata else [])}
-            self.ctx.approval = self.approval                              # every in-process dispatch sees the same approval
-            raw_cm = (self._shared_retrieval_tools() if self.config.unified_mcp else
-                      self._memory_tools(self.ctx, "retrieval") if self.config.uses_memory_mcp else McpTools.direct(self.ctx))
-            gate_ctx: Any = self.ctx
-        else:
-            args = ["--offline", "--cache-dir", str(self.cache_dir), "--out-dir", str(self.run_dir.parent), "--run-id", self.run_id]
-            env = None
-            if self.config.snapshot:                                   # the child reads the snapshot's cache under the snapshot's server address
-                from mcp.client.stdio import get_default_environment
-
-                env = {**get_default_environment(), "BRAPI_BASE_URL": server, "BRAPI_MODE": "offline"}
-            else:
-                args += ["--fixture", self.config.fixture or "synthetic"]
-            raw_cm = McpTools.mcp(server_args=args, env=env)
-            gate_ctx = SimpleNamespace(client=SimpleNamespace(settings=SimpleNamespace(base_url=server)), registry=stub)
+        model = self.models.retriever or await self._real_model()
+        self.ctx = self._build_ctx(self.run_dir.parent)
+        self.ctx.variable_measurements = {v.variable_id: MeasurementMeta(trait=v.trait or v.name or None, unit=v.unit)
+                                          for v in (self.metadata.variables if self.metadata else [])}
+        self.ctx.approval = self.approval
+        raw_cm = self._shared_retrieval_tools()
         catalog_exports = [dict(step.inputs) for step in (self.plan.steps if self.plan else [])
                            if step.agent == "retriever" and step.action == "export_metadata"]
         try:
             async with raw_cm as raw:
-                tools = ApprovedTools(raw, gate_ctx, self.approval, now_utc=self.now)
+                tools = ApprovedTools(raw, self.ctx, self.approval, now_utc=self.now)
                 request = self._retriever_request()
                 replies: list[dict[str, str]] = []
                 while True:
@@ -1323,13 +1013,9 @@ class Controller:
                 evidence = await raw.call("request_log", {"run_id": self.run_id})
                 self.requests = list(evidence.data.get("records", [])) if evidence.ok and isinstance(evidence.data, dict) else []
         finally:
-            if (self.config.direct or self.config.uses_memory_mcp) and self.ctx is not None:
+            if self.ctx is not None:
                 # A protocol/model failure must not discard completed HTTP evidence.
                 self.requests = [record.model_dump(mode="json") for record in self.ctx.client.provenance()]
-        if self.ctx is None:                                                   # MCP mode: the child owned the registry until now
-            self.ctx = self._build_ctx(self.run_dir.parent)
-            for study_id, status, reason in stub.entries:
-                self.ctx.registry.record_study(study_id, status, reason=reason)   # type: ignore[arg-type]
         if metadata_only_plan(self.plan) and agent.status == "completed":
             materialize_metadata(self.plan, tools, self.ctx)
         fetches = any(s.action in ("get_observations", "get_observation_units") for s in (self.plan.steps if self.plan else []))
@@ -1375,23 +1061,19 @@ class Controller:
             return
         if catalog_count_plan(self.plan):
             assert self.retrieval is not None
-            self.analysis_execution = {"route": "catalog_tools", "tool_transport": "memory" if self.config.uses_memory_mcp else "direct"}
-            if self.config.uses_memory_mcp:
-                supplied = {a.artifact_id for a in self.retrieval.artifacts}
-                sources = list(dict.fromkeys(h for handles in self.catalog_sources.values() for h in handles if h in supplied))
-                async with self._analysis_tools(sources) as raw:
-                    self.analysis = await run_catalog_plan_async(self.plan, self.retrieval, self.ctx.registry, tools=raw,
-                                                                 export_sources=self.catalog_sources, budget=self.budget, clock=_clock)
-            else:
-                self.analysis = run_catalog_plan(self.plan, self.retrieval, self.ctx.registry,
-                                                 export_sources=self.catalog_sources, budget=self.budget, clock=_clock)
+            self.analysis_execution = {"route": "catalog_tools", "tool_transport": "memory"}
+            supplied = {a.artifact_id for a in self.retrieval.artifacts}
+            sources = list(dict.fromkeys(h for handles in self.catalog_sources.values() for h in handles if h in supplied))
+            async with self._analysis_tools(sources) as raw:
+                self.analysis = await run_catalog_plan_async(self.plan, self.retrieval, self.ctx.registry, tools=raw,
+                                                             export_sources=self.catalog_sources, budget=self.budget, clock=_clock)
             self.narrative = ""
             return
         artifacts = self.eligible_artifacts()
         if not artifacts:
             self.analysis = AnalysisReport(status="blocked", caveats=["no complete artifact is eligible for analysis"])
             return
-        self.analysis_execution = {"route": "model_tools", "tool_transport": "memory" if self.config.uses_memory_mcp else "direct"}
+        self.analysis_execution = {"route": "model_tools", "tool_transport": "memory"}
         async with self._analysis_tools(artifacts) as raw:
             await self._analyze_model_turns(artifacts, raw_tools=raw)
 
@@ -1404,8 +1086,6 @@ class Controller:
         while True:
             if self.models.analyst_factory is not None:
                 model = self.models.analyst_factory(prefix)
-            elif self.config.mock_model:
-                model = load_analyst_script("valid_ab.json", ANALYST_FIXTURES, prefix=prefix)
             else:
                 model = await self._real_model()
             inputs = AnalysisInput(question=self.plan.question, artifact_ids=artifacts, requested_variable_ids=list(self.plan.scope.variable_ids),
@@ -1469,7 +1149,7 @@ class Controller:
     def build_result(self) -> RunResult:
         artifacts = [self.ctx.registry.manifest(a) for a in self.ctx.registry.artifact_ids()] if self.ctx is not None else []
         # a run that was blocked before planning did no work; its record still needs a server name, so this one place keeps a label
-        plan = self.plan or _placeholder_plan(self.config.question, self.base_url or SYNTHETIC_BASE, self.now())
+        plan = self.plan or _placeholder_plan(self.config.question, self.base_url, self.now())
         approved_hash = self.manifest.sha256() if (self.approval is not None and self.manifest is not None) else None
         reported = next((a.model_reported for a in self.agents if a.model_reported), None)
         catalog = self.catalog_setup or {}
@@ -1576,61 +1256,3 @@ def _placeholder_plan(question: str, base_url: str, now: datetime) -> Plan:
     return Plan(plan_id=f"plan_none_{uuid.uuid4().hex[:6]}", question=question or "(empty question)", interpretation="no plan was produced",
                 status="draft", scope=ResolvedScope(base_url=base_url), steps=[PlanStep(step_id="step_none", agent="retriever", action="none", max_tool_calls=1)],
                 created_at_utc=now)
-
-
-# --------------------------------------------------------------------------
-# CLI: exactly one asyncio.run
-# --------------------------------------------------------------------------
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="python -m run", description="Ask the read-only BrAPI assistant one question.")
-    parser.add_argument("question")
-    parser.add_argument("--offline", action="store_true", default=True, help="the default: no live BrAPI, even on a cache miss")
-    parser.add_argument("--live", action="store_true", help="the real server in .env; needs BRAPI_MODE=live, --direct, a reviewed ACCESS_NOTES.md "
-                                                           "and your typed approve at the screen (never with --auto)")
-    parser.add_argument("--mock-model", action="store_true", help="scripted replies instead of the local model")
-    parser.add_argument("--direct", action="store_true", help="in-process tools instead of the MCP child (transport only)")
-    parser.add_argument("--auto", action="store_true", help="never ask for input; never grant live access; never record acceptance")
-    parser.add_argument("--max-fetches", type=int, default=5, help="ceiling on fetch tool calls (not a permission)")
-    parser.add_argument("--max-http-attempts", type=int, default=20)
-    parser.add_argument("--read-timeout", type=float, default=None, help="live read timeout in seconds, 1-600")
-    parser.add_argument("--max-elapsed-seconds", type=float, default=300.0, help="run work budget, 60-3600 seconds")
-    parser.add_argument("--snapshot", default=None, help="a prepared offline snapshot under part2/snapshots/<ID>")
-    parser.add_argument("--fixture", default=None, help="'synthetic' for the invented teaching server")
-    parser.add_argument("--out-dir", default=None, help="harness only: where out/<run_id> goes")
-    parser.add_argument("--cache-dir", default=None, help="harness only: cache folder for the fixture (never with --snapshot)")
-    parser.add_argument("--snapshots-dir", default=None, help="harness only: parent folder of the prepared snapshots")
-    return parser.parse_args(argv)
-
-
-def config_from_args(ns: argparse.Namespace) -> RunConfig:
-    default_fixture = None if (ns.snapshot or ns.live) else "synthetic"
-    return RunConfig(question=ns.question, offline=not ns.live, mock_model=ns.mock_model, direct=ns.direct, auto=ns.auto, max_fetches=ns.max_fetches,
-                     max_http_attempts=ns.max_http_attempts, read_timeout=ns.read_timeout, max_elapsed_seconds=ns.max_elapsed_seconds, snapshot=ns.snapshot, fixture=ns.fixture if ns.fixture else default_fixture,
-                     out_dir=Path(ns.out_dir) if ns.out_dir else PART2_DIR / "out", cache_dir=Path(ns.cache_dir) if ns.cache_dir else None,
-                     snapshots_dir=Path(ns.snapshots_dir) if ns.snapshots_dir else PART2_DIR / "snapshots")
-
-
-def main(argv: list[str] | None = None) -> int:
-    ns = parse_args(argv)
-    config = config_from_args(ns)
-    problems = config.validate()
-    if problems:
-        for p in problems:
-            print(f"configuration error: {p}", file=sys.stderr)
-        return CONFIG_ERROR_EXIT
-    controller = Controller(config, models=synthetic_models() if config.mock_model else Models(requested="local-model"))
-    try:
-        result = asyncio.run(controller.run())                      # the ONE event loop of the process
-    except KeyboardInterrupt:                                        # Ctrl+C arrived after the loop stopped: still record it
-        controller.execution_status = "canceled"
-        controller.notes.append("Ctrl+C: run canceled; the MCP child was closed")
-        result = controller.record()
-    print(f"\nRUN {result.run_id}: execution_status={result.execution_status} human_acceptance={result.human_acceptance}")
-    for name, path in controller.output_paths().items():
-        print(f"  {name:<13}: {path}")
-    return EXIT_CODES.get(result.execution_status, 1)
-
-
-if __name__ == "__main__":
-    sys.exit(main())

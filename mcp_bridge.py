@@ -1,62 +1,27 @@
-"""
-mcp_bridge.py — one session to the twelve tools, for the agents.
+"""MCP sessions for the hosted breeding service.
 
-An agent loop (Task 3B) asks two things: "what tools exist, with what arguments?"
-and "run this tool with these arguments". McpTools answers both through ONE
-async, context-managed session that lives for the whole run:
-
-    async with McpTools.mcp(server_args=[...]) as tools:      # real MCP: a stdio child process
-        schemas = await tools.schemas()                        # the server's advertised tools
-        result = await tools.call("get_study", {"study_db_id": "S1"})   # -> ToolResult
-
-    async with McpTools.memory(ctx) as tools:                  # real MCP, local SDK memory streams
-        ...
-
-    async with McpTools.direct(ctx) as tools:                  # same tools, same validators, no transport
-        ...
-
-Design rules:
-* The server child is started with sys.executable and the server file's resolved
-  absolute path; it inherits an explicit environment (offline by default).
-* One event-loop lifetime per run. The caller does exactly one asyncio.run (or
-  anyio.run); this module never starts loops of its own.
-* Tool schemas are converted to the model's function-tool shape by wrapping the
-  server's own inputSchema — no second schema definition exists anywhere.
-* Replies are decoded deliberately: structured content or text that is a valid
-  ToolResult -> ToolResult; an MCP-level error with plain text (for example the
-  server's schema check) -> ToolResult(ok=False, invalid_argument); anything
-  malformed or unsupported (images, empty content, invalid JSON) -> BridgeError,
-  never silently turned into an "ok" result.
-* A timeout raises BridgeTimeout and marks the session unusable; leaving the
-  context closes the child, also after errors and cancellation.
-
-Everyday example: a phone line to the library desk. You dial once (the session),
-ask "what forms do you have?" (schemas) and "please process form 4" (call). If the
-line drops or the desk stalls, you hear a clear message — not a fabricated answer.
+The controller supplies a scoped server factory. Initialization, tool discovery,
+and calls use real MCP over SDK memory streams. Direct dispatch remains an
+explicit adapter for focused offline tests; the hosted controller cannot select
+it. There is no standalone child-process launcher in this package.
 """
 from __future__ import annotations
 
 import json
 import math
 import time
-import os
-import sys
 from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from datetime import timedelta
-from pathlib import Path
 from typing import Any, Literal
 
 import anyio
 from pydantic import ValidationError
 
-from brapi_client import PART2_DIR
 from contracts import ToolError, ToolResult
 
-__all__ = ["SERVER_PATH", "BridgeError", "BridgeTimeout", "BridgeClosed", "McpTools", "to_model_tools"]
+__all__ = ["BridgeError", "BridgeTimeout", "BridgeClosed", "McpTools", "to_model_tools"]
 
-SERVER_PATH = (PART2_DIR / "brapi_mcp_server.py").resolve()
-OFFLINE_ENV = {"BRAPI_MODE": "offline", "LLM_ALLOW_REMOTE": "false"}
 
 
 class BridgeError(Exception):
@@ -97,29 +62,23 @@ class McpTools:
     def __init__(
         self,
         *,
-        mode: Literal["mcp", "direct", "memory"],
-        server_args: list[str] | None = None,
-        env: Mapping[str, str] | None = None,
-        cwd: Path | None = None,
+        mode: Literal["direct", "memory"],
         ctx: Any = None,
         call_timeout: float = 60.0,
-        server_path: Path = SERVER_PATH,
-        python: str = sys.executable,
         remaining_time: Callable[[], float] | None = None,
         server_factory: Callable[[Any], Any] | None = None,
     ) -> None:
-        if mode not in ("mcp", "direct", "memory"):
+        if mode not in ("direct", "memory"):
             raise BridgeError(f"unknown mode {mode!r}")
         if mode in ("direct", "memory") and ctx is None:
             raise BridgeError(f"{mode} mode needs a ToolContext (brapi_mcp_server.build_context)")
+        if mode == "memory" and server_factory is None:
+            raise BridgeError("memory MCP requires a controller-owned server factory")
         if server_factory is not None and mode != "memory":
             raise BridgeError("a custom server factory is only supported in memory mode")
         if not math.isfinite(call_timeout) or call_timeout <= 0:
             raise BridgeError("call_timeout must be positive")
         self.mode = mode
-        self.server_args = list(server_args or ["--offline", "--fixture", "synthetic"])
-        self.env = {**os.environ, **OFFLINE_ENV, **(dict(env) if env else {})}
-        self.cwd = Path(cwd) if cwd else PART2_DIR
         self.ctx = ctx
         self.call_timeout = call_timeout
         self.remaining_time = remaining_time
@@ -128,8 +87,6 @@ class McpTools:
         self._memory_group: Any = None
         self._operation_deadline: float | None = None
         self._previous_remaining_time: Callable[[], float] | None = None
-        self.server_path = Path(server_path).resolve()
-        self.python = python
         self._stack: AsyncExitStack | None = None
         self._session: Any = None
         self._open = False
@@ -138,10 +95,6 @@ class McpTools:
 
     # -- constructors ------------------------------------------------------------
 
-    @classmethod
-    def mcp(cls, *, server_args: list[str] | None = None, env: Mapping[str, str] | None = None,
-            cwd: Path | None = None, call_timeout: float = 60.0, server_path: Path = SERVER_PATH) -> "McpTools":
-        return cls(mode="mcp", server_args=server_args, env=env, cwd=cwd, call_timeout=call_timeout, server_path=server_path)
 
     @classmethod
     def direct(cls, ctx: Any, *, call_timeout: float = 60.0) -> "McpTools":
@@ -193,31 +146,20 @@ class McpTools:
             raise BridgeError("session already open")
         if self._broken:
             raise BridgeClosed(f"session unusable after: {self._broken}")
-        if self.mode in ("mcp", "memory"):
-            from mcp import ClientSession, StdioServerParameters
+        if self.mode == "memory":
+            from mcp import ClientSession
+            from mcp.shared.memory import create_client_server_memory_streams
 
             self._stack = AsyncExitStack()
             try:
-                if self.mode == "memory":
-                    from mcp.shared.memory import create_client_server_memory_streams
-                    from brapi_mcp_server import build_server
-
-                    server = self.server_factory(self.ctx) if self.server_factory is not None else build_server(self.ctx)
-                    streams = await self._stack.enter_async_context(create_client_server_memory_streams())
-                    (read, write), (server_read, server_write) = streams
-                    self._memory_group = await self._stack.enter_async_context(anyio.create_task_group())
-                    self._memory_group.start_soon(server.run, server_read, server_write,
-                                                  server.create_initialization_options())
-                    self._previous_remaining_time = self.ctx.client.remaining_time
-                    self.ctx.client.remaining_time = self._client_remaining_time
-                else:
-                    from mcp.client.stdio import stdio_client
-
-                    if not self.server_path.is_file():
-                        raise BridgeError(f"server file not found: {self.server_path}")
-                    params = StdioServerParameters(command=self.python, args=[str(self.server_path), *self.server_args],
-                                                   env=self.env, cwd=str(self.cwd))
-                    read, write = await self._stack.enter_async_context(stdio_client(params))
+                server = self.server_factory(self.ctx)
+                streams = await self._stack.enter_async_context(create_client_server_memory_streams())
+                (read, write), (server_read, server_write) = streams
+                self._memory_group = await self._stack.enter_async_context(anyio.create_task_group())
+                self._memory_group.start_soon(server.run, server_read, server_write,
+                                              server.create_initialization_options())
+                self._previous_remaining_time = self.ctx.client.remaining_time
+                self.ctx.client.remaining_time = self._client_remaining_time
                 self._session = await self._stack.enter_async_context(ClientSession(read, write))
                 with anyio.fail_after(self._allowance()):
                     await self._session.initialize()
@@ -245,13 +187,11 @@ class McpTools:
             group.cancel_scope.cancel()
         stack, self._stack = self._stack, None
         if stack is not None:
-            # Exits stdio_client and ClientSession in the order they were entered (anyio requires this);
-            # stdio_client's own teardown closes stdin, waits, then terminates the child if needed.
+            # Close ClientSession, server task group, and streams in reverse entry order.
             try:
                 await stack.aclose()
             except BaseExceptionGroup as group:
-                # After a timeout the child's LATE reply can hit a stream that is already closing.
-                # stdio_client has already terminated the child; swallow only that stream noise.
+                # A late reply can hit a closing stream after a timeout; ignore only stream noise.
                 # split(noise) -> (the noise, everything else); a callable predicate would be applied to
                 # the nested TaskGroup itself and never match, so the plain type tuple is the right tool.
                 noise = (anyio.BrokenResourceError, anyio.ClosedResourceError)
@@ -376,38 +316,3 @@ def decode_call_result(reply: Any, name: str) -> ToolResult:
         # the MCP layer itself refused (for example the server's inputSchema check); keep it as a coded error
         return ToolResult(ok=False, error=ToolError(code="invalid_argument", message=f"{name}: {text[:500] or 'rejected by the server'}"))
     raise BridgeError(f"{name}: reply text is neither a ToolResult nor an error: {text[:120]!r}")
-
-
-# --------------------------------------------------------------------------
-# Small self-check CLI: one asyncio.run for the whole run
-# --------------------------------------------------------------------------
-
-async def _selfcheck(server_args: list[str], call_timeout: float) -> int:
-    async with McpTools.mcp(server_args=server_args, call_timeout=call_timeout) as tools:
-        schemas = await tools.schemas()
-        print(f"{len(schemas)} tools advertised: {[s['name'] for s in schemas]}")
-        info = await tools.call("server_info", {})
-        print(f"server_info ok={info.ok} server={info.data.get('server_name') if info.data else None} live_requests=0 (offline)")
-        return 0 if len(schemas) == 12 and info.ok else 1
-
-
-def main(argv: list[str] | None = None) -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(prog="python -m mcp_bridge", description="Bridge self-check over a real stdio child (offline).")
-    parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--fixture", default="synthetic")
-    parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--out-dir", default=None)
-    parser.add_argument("--call-timeout", type=float, default=60.0)
-    args = parser.parse_args(argv)
-    server_args = ["--offline", "--fixture", args.fixture]
-    if args.cache_dir:
-        server_args += ["--cache-dir", args.cache_dir]
-    if args.out_dir:
-        server_args += ["--out-dir", args.out_dir]
-    return anyio.run(_selfcheck, server_args, args.call_timeout)     # ONE loop for the whole run
-
-
-if __name__ == "__main__":
-    sys.exit(main())

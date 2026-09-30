@@ -23,7 +23,7 @@ from brapi_client import load_settings
 from run import (ANALYST_PROMPT, CLARIFY_PROMPT, CATALOG_PROMPT, DATA_REVIEW_PROMPT, RETRIEVER_PROMPT, SUPERVISOR_PROMPT,
                  Controller, Models, RunConfig, analyst_questions)
 
-__all__ = ["Job", "live_config", "live_preflight", "respond", "render", "build_ui", "main", "REPLY_TIMEOUT_S", "locked", "after_step",
+__all__ = ["Job", "live_config", "live_preflight", "respond", "render", "build_ui", "REPLY_TIMEOUT_S", "locked", "after_step",
            "reply_buttons", "start_over"]
 
 REPLY_TIMEOUT_S = 15 * 60          # how long a run waits for your reply in the chat before it cancels itself
@@ -114,7 +114,7 @@ def _app_number(name: str, default: str, low: float, high: float, *, integer: bo
 
 
 def live_config(question: str) -> RunConfig:
-    return RunConfig(question=question, offline=False, mock_model=False, direct=True, auto=False, fixture=None,
+    return RunConfig(question=question, offline=False, mock_model=False, direct=False, auto=False,
                      max_fetches=5, max_http_attempts=_app_number("APP_MAX_HTTP_ATTEMPTS", "10", 1, 100, integer=True),
                      max_clarification_rounds=CHAT_CLARIFICATION_ROUNDS,
                      read_timeout=_app_number("APP_READ_TIMEOUT", "90", 1, 600), max_elapsed_seconds=600,
@@ -463,15 +463,3 @@ def launch_options(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
                          "(set APP_ALLOW_OPEN=true only after you verify that the Space is private)")
     host = values.get("GRADIO_SERVER_NAME", "").strip() or ("0.0.0.0" if is_space else "127.0.0.1")
     return {"server_name": host, "auth": (user, password) if has_user and has_password else None}
-
-
-def main() -> None:
-    options = launch_options()
-    import gradio as gr
-
-    build_ui().queue(max_size=CHAT_QUEUE_SIZE, default_concurrency_limit=1).launch(
-        **options, theme=build_theme(), css=CSS)
-
-
-if __name__ == "__main__":
-    main()

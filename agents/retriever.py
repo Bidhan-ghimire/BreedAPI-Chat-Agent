@@ -1,53 +1,23 @@
-"""
-agents/retriever.py — the Retriever: find the exact records, fetch only what is approved,
-hand back evidence. It never computes a statistic.
+"""Data Retriever agent components for the hosted breeding assistant.
 
-What the Retriever does, in order:
-1. Discovers metadata with the read-only tools (search_studies, list_variables,
-   list_locations, ...). Human words such as "Ibadan" or "yield" are turned into
-   exact IDs by looking at tool results — never by guessing.
-2. Fetches observations / observation units ONLY for exact study and variable IDs
-   that a code-issued FetchApproval allows. The approval is checked here, in the
-   dispatcher, before the tool runs (and again inside the client for any live
-   request). No approval -> blocked. An expired approval, or one issued for a
-   different server -> blocked. A study not on the approval -> blocked. A tenth
-   distinct study when nine were approved -> blocked. The model cannot pass,
-   change or raise an approval: the tool schemas refuse such arguments.
-3. Returns a validated RetrievalReport whose facts come from TOOL EVIDENCE the code
-   recorded, not from the model's prose: resolved IDs must have appeared in a tool
-   result (an invented ID fails the run), labels are taken from the records,
-   artifacts come from the registry, and the per-study ledger keeps zero-row,
-   failed and blocked studies — a study never disappears from a comparison.
-4. If the request is ambiguous (two candidate variables, two studies), it returns
-   needs_clarification with a question instead of picking the first fuzzy match.
-   For catalog questions it uses export_metadata so the Analyst gets full tables.
-
-Names and descriptions coming back from the database are DATA. A study called
-"IGNORE PREVIOUS INSTRUCTIONS" is a study with a strange name, nothing more.
-
-Everyday example: a research librarian. You ask for "the yield trial at Ibadan";
-she looks up the exact call numbers, brings only the boxes your reader's card
-allows, and hands you a slip listing every box — including the ones that were
-empty or refused — without summarising what is inside them.
+The controller owns approval and shared MCP sessions. ApprovedTools checks each
+requested tool against that permission, and build_report records only evidence
+returned by the tools. Explicit model-script loading remains for offline tests.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import re
-import sys
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import anyio
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from brapi_client import PART2_DIR
-from brapi_mcp_server import ExportMetadataArgs, ToolContext, build_context
+from brapi_mcp_server import ExportMetadataArgs, ToolContext
 from contracts import (
     AgentResult,
     ArtifactManifest,
@@ -59,15 +29,13 @@ from contracts import (
     TerminalStatus,
     ToolError,
     ToolResult,
-    dump_json,
 )
-from explore_cassavabase import SYNTHETIC_BASE
 from llm import FETCH_TOOLS, Budget, FakeModelClient, ModelClient, reply_text, reply_tools, run_agent_loop
 from mcp_bridge import McpTools
 
 __all__ = [
     "RETRIEVER_TOOLS", "RETRIEVER_SYSTEM_PROMPT", "RetrieverPayload", "ApprovedTools", "run_retriever",
-    "load_model_script", "synthetic_approval", "render_report", "main", "FIXTURE_DIR",
+    "load_model_script", "render_report", "FIXTURE_DIR",
 ]
 
 FIXTURE_DIR = PART2_DIR / "tests" / "fixtures" / "model_retriever"
@@ -232,21 +200,6 @@ class ApprovedTools:
 # --------------------------------------------------------------------------
 # Running the Retriever and building the report from evidence
 # --------------------------------------------------------------------------
-
-def synthetic_approval(*, run_id: str, studies: list[str] | None = None, variables: list[str] | None = None,
-                       max_studies: int | None = None, base_url: str = SYNTHETIC_BASE) -> FetchApproval:
-    """An explicit approval for the SYNTHETIC server, built by harness/controller code — never by a model."""
-    now = datetime.now(timezone.utc)
-    studies = ["S1"] if studies is None else list(studies)
-    variables = ["V1"] if variables is None else list(variables)
-    return FetchApproval(
-        approval_id=f"appr_synth_{uuid.uuid4().hex[:8]}", run_id=run_id, base_url=base_url,
-        endpoint_families=["serverinfo", "studies", "observationvariables", "locations", "programs", "seasons",
-                           "observations", "observationunits"],
-        observation_study_ids=studies, observation_variable_ids=variables,
-        max_http_attempts=50, max_observation_studies=len(studies) if max_studies is None else max_studies,
-        issued_at_utc=now - timedelta(seconds=1), expires_at_utc=now + timedelta(hours=1),
-    )
 
 
 async def run_retriever(
@@ -490,37 +443,3 @@ def render_report(report: RetrievalReport, agent: AgentResult) -> str:
         lines.append(f"  note          : {w}")
     lines.append(f"  log           : {', '.join(report.log_refs)}")
     return "\n".join(lines)
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m agents.retriever", description="Retriever agent (mock-model, offline harness).")
-    parser.add_argument("request")
-    parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--mock-model", action="store_true", help="scripted fake model; required in this version")
-    parser.add_argument("--script", default="valid_request.json", help="fixture under tests/fixtures/model_retriever")
-    parser.add_argument("--fixture", default="synthetic")
-    parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--out-dir", default=None)
-    args = parser.parse_args(argv)
-    if not args.mock_model or not args.offline:
-        print("This version runs only with --offline --mock-model. A real-model retrieval run is approved per run in Stage 5.", file=sys.stderr)
-        return 2
-    run_id = f"retr_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}_{uuid.uuid4().hex[:6]}"
-    out_dir = Path(args.out_dir) if args.out_dir else PART2_DIR / "out"
-    ctx = build_context(fixture=args.fixture, cache_dir=Path(args.cache_dir) if args.cache_dir else None, out_dir=out_dir, run_id=run_id)
-    approval = synthetic_approval(run_id=run_id)          # explicit harness approval for S1/V1 on the SYNTHETIC server
-
-    async def go():
-        return await run_retriever(args.request, model=load_model_script(args.script), ctx=ctx, approval=approval,
-                                   budget=Budget(), run_id=run_id, log_dir=out_dir)
-
-    report, agent = anyio.run(go)
-    print(render_report(report, agent))
-    report_path = out_dir / run_id / "retrieval_report.json"
-    report_path.write_text(dump_json(report), encoding="utf-8")
-    print(f"  saved         : {report_path}")
-    return 0 if report.status in ("completed", "needs_clarification") else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

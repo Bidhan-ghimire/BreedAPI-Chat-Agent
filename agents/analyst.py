@@ -1,58 +1,30 @@
-"""
-agents/analyst.py — the Analyst: inspects the artifacts it was given, chooses FIXED calculation
-tools, and hands back an AnalysisReport whose numbers come from tool results, never from prose.
+"""Data Analyst agent for the hosted breeding assistant.
 
-What the Analyst does, in order:
-1. Receives an AnalysisInput: the question, the artifact handles the Retriever produced, and
-   (when known) the variable IDs the question is about. It has ONLY the eight tools of
-   analyst_tools.py — no BrAPI tools, no network, no file paths.
-2. Code guards that run BEFORE and DURING the model's turns (a prompt is not a boundary):
-   - precheck: if the artifacts do not contain the requested variable (dry matter asked, fresh
-     root yield supplied), the run is `blocked` without a model call;
-   - inspect first: any calculation before table_info has been called on EVERY supplied
-     artifact is refused with an instruction to inspect first;
-   - scope: any artifact handle that was neither supplied nor produced by this run's own tools
-     is refused (not_authorized), even if it exists in the registry.
-3. Builds the AnalysisReport from EVIDENCE the code recorded: the claims are exactly the typed
-   claims the tools returned; exclusions and caveats come from the tools' own warnings; result
-   artifacts are the tables the tools saved. The model's final JSON may add methods and caveats
-   and pick key claims by ID (an unknown ID fails the run). Its narrative is returned beside the
-   report, labelled "not authoritative", and is WITHHELD when it asserts a best or superior clone
-   from a descriptive mean.
-4. Status: needs_clarification when the model asks; blocked by the precheck; incomplete when any
-   claim rests on an incomplete artifact; failed when the payload is malformed or names unknown
-   claims or no tool produced a claim; otherwise completed.
-
-Everyday example: a lab technician with a fixed set of validated instruments. She can pick which
-instrument to use and write a note on the printout, but the printout is the result — the note
-cannot change a number, and "sample 3 is the best" is crossed out unless the instrument said so.
+Guarded tools accept only registered, reviewed tables. The model selects typed
+calculations; code builds claims with their denominators, methods, and evidence.
+Explicit synthetic-input and model-script helpers remain for offline tests.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import re
-import sys
-import uuid
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import anyio
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from analyst_tools import ANALYSIS_TARGET, ANALYST_TOOL_NAMES, AnalystTools
 from brapi_client import PART2_DIR
-from brapi_mcp_server import ToolContext, build_context, dispatch
-from contracts import AgentResult, AnalysisReport, Claim, Exclusion, TerminalStatus, ToolError, ToolResult, dump_json
+from brapi_mcp_server import ToolContext, dispatch
+from contracts import AgentResult, AnalysisReport, Claim, Exclusion, TerminalStatus, ToolError, ToolResult
 from llm import Budget, FakeModelClient, ModelClient, ToolInterface, reply_text, reply_tools, run_agent_loop
 
 __all__ = [
     "ANALYST_SYSTEM_PROMPT", "AnalysisInput", "AnalystPayload", "GuardedAnalystTools", "run_analyst", "build_report",
-    "render_report", "synthetic_inputs", "load_analyst_script", "registry_prefix", "main", "FIXTURE_DIR",
+    "render_report", "synthetic_inputs", "load_analyst_script", "registry_prefix", "FIXTURE_DIR",
 ]
 
 FIXTURE_DIR = PART2_DIR / "tests" / "fixtures" / "model_analyst"
@@ -389,38 +361,3 @@ def render_report(report: AnalysisReport, agent: AgentResult | None, narrative: 
     lines.append(f"  log           : {', '.join(report.log_refs) or '(no model run)'}")
     lines.append("  model narrative (NOT authoritative; the claims above are): " + (narrative or "(none)"))
     return "\n".join(lines)
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m agents.analyst", description="Analyst agent (mock-model, offline harness on SYNTHETIC artifacts).")
-    parser.add_argument("question")
-    parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--mock-model", action="store_true", help="scripted fake model; required in this version")
-    parser.add_argument("--script", default="valid_ab.json", help="fixture under tests/fixtures/model_analyst")
-    parser.add_argument("--requested-variable", action="append", default=None, help="variable ID the question is about (default V1)")
-    parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--out-dir", default=None)
-    args = parser.parse_args(argv)
-    if not args.mock_model or not args.offline:
-        print("This version runs only with --offline --mock-model. A real-model analysis run is approved per run in Stage 5.", file=sys.stderr)
-        return 2
-    run_id = f"anal_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}_{uuid.uuid4().hex[:6]}"
-    out_dir = Path(args.out_dir) if args.out_dir else PART2_DIR / "out"
-    ctx = build_context(fixture="synthetic", cache_dir=Path(args.cache_dir) if args.cache_dir else None, out_dir=out_dir, run_id=run_id)
-    inputs = synthetic_inputs(ctx, args.question, requested_variable_ids=args.requested_variable)
-
-    async def go():
-        model = load_analyst_script(args.script, FIXTURE_DIR, prefix=registry_prefix(inputs.artifact_ids[0]))
-        return await run_analyst(inputs, model=model, ctx=ctx, budget=Budget(), run_id=run_id, log_dir=out_dir)
-
-    report, agent, narrative = anyio.run(go)
-    print(render_report(report, agent, narrative))
-    report_path = out_dir / run_id / "analysis_report.json"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(dump_json(report), encoding="utf-8")
-    print(f"  saved         : {report_path}")
-    return 0 if report.status in ("completed", "needs_clarification") else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
