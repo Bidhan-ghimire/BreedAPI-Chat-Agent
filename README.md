@@ -1,16 +1,3 @@
----
-title: BreedAPI Chat Agent
-emoji: 🌱
-colorFrom: green
-colorTo: blue
-sdk: gradio
-sdk_version: 6.29.0
-python_version: "3.11"
-app_file: app_space.py
-pinned: false
-short_description: Explore breeding data with MCP and human review
----
-
 # BreedAPI Chat Agent
 
 ![Workflow showing the Coordinator, Data Retriever and Data Analyst agents, MCP, BrAPI-compliant databases, and human-in-the-loop verification](docs/images/workflow.png)
