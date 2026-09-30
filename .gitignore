@@ -1,0 +1,26 @@
+# Credentials and private configuration
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*
+
+# Environments, generated records and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+cache/
+out/
+logs/
+snapshots/
+eval/results/
+*.log
+
+# Operating-system/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

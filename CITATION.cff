@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software or its code in research, please cite it and record the release or commit used."
+type: software
+title: BreedAPI Chat Agent
+authors:
+  - family-names: Ghimire
+    given-names: Bidhan
+repository-code: "https://github.com/Bidhan-ghimire/BreedAPI-Chat-Agent"
+url: "https://huggingface.co/spaces/bidhanghimire/brapi-breeding-assistant"
+date-released: 2026-09-30
+abstract: "A conversational assistant for public breeding data, using Coordinator, Data Retriever and Data Analyst agents, MCP, BrAPI and human-in-the-loop verification."
+keywords:
+  - plant breeding
+  - BrAPI
+  - MCP
+  - decision support
