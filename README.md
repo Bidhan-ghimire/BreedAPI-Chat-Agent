@@ -67,7 +67,7 @@ If you use this software, its code or its outputs in research, **please cite thi
 
 Suggested citation:
 
-> Ghimire, B. (2026). *BreedAPI Chat Agent* [Computer software]. GitHub. https://github.com/Bidhan-ghimire/BreedAPI-Chat-Agent
+> Ghimire, B. (2026). *BreedAPI Chat Agent* [Computer software]. GitHub. https://github.com/Bidhan-ghimire/BrAPI-breeding-data-assistant
 
 GitHub's **Cite this repository** option provides a citation you can copy; add the release or commit used in your study.
 
