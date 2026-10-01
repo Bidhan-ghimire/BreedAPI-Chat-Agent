@@ -1,4 +1,4 @@
-# BreedAPI Chat Agent
+# BreedAPI Data Assistant
 
 ![Workflow showing the Coordinator, Data Retriever and Data Analyst agents, MCP, BrAPI-compliant databases, and human-in-the-loop verification](docs/images/workflow.png)
 
